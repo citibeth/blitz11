@@ -36,7 +36,23 @@ Nice-To-Have Features
 
 */
 
-typedef std::function<void (int idim, long low, long high, long index)> RangeErrorFn;
+
+#include <type_traits>
+
+/** Transfers const qualification (if any) from DestT to SrcT;
+Eg:  transfer_const<double, char const>::type == double const
+     transfer_const<double, char>::type == double
+*/
+template<class DestT, class SrcT>
+struct transfer_const {
+    typedef std::conditional<
+        std::is_const<SrcT>::value,
+            std::add_const<DestT>::type
+            std::remove_const<DestT>::type
+    > type;
+};
+
+typedef std::function<void (std::string const &type, int idim, long low, long high, long index)> RangeErrorFn;
 
 // https://stackoverflow.com/questions/13061979/shared-ptr-to-an-array-should-it-be-used
 template< typename T >
@@ -50,63 +66,46 @@ struct array_deleter
 
 
 /**
-Const handling:
-   const MemoryBlock: Indexing returns const char
-   MemoryBlock: Indexing returns char
-
-   In either case, MemoryBlock is immutable (due to consts inside)
+Const handling: CharT is either char or const char.
 
 TODO: Add STL-standard Allocator support.
 TODO: char->std::byte for C++17 */
+template<class CharT>
 class MemoryBlock {
-    std::shared_ptr<char> held;    // Memory we hold
+    typedef transfer_const<char,ValueT>::type CharT;
+
+    std::shared_ptr<CharT> _held;    // Memory we hold
+
+    CharT * _base;
+    size_t _size_bytes;
 
 public:
-    char * const base;
-    size_t const size_bytes;
+    size_t const size_bytes() { return size_bytes; }
+    CharT *base() { return base(); }
 
     /** Allocate our own memory to a particular size */
-    MemoryBlock(size_t _size_bytes) :
-        held(new char[_size_bytes]),
-        base(held.get()),
-        size_bytes(_size_bytes) {}
+    MemoryBlock(size_t size_bytes) :
+        held(new CharT[size_bytes], array_deleter<CharT>()),
+        _base(held.get()),
+        _size_bytes(size_bytes) {}
 
     /** Use someone else's memory of a particular size */
     MemoryBlock(
-        char const *_base,
-        char const _size_bytes)
-    : base(_base), size_bytes(_size_bytes) {}
+        CharT * const base,
+        CharT const size_bytes)
+    : _base(base), _size_bytes(size_bytes) {}
 
 
 private:
     /** Index into the MemoryBlock, by bytes, and possibly check ranges */
-    inline char const *index_bytes(ptrdiff_t const diff_bytes, RangeErrorFn *range_error = nullptr) const
+    inline CharT *index_bytes(ptrdiff_t const diff_bytes, RangeErrorFn const *range_error = nullptr) const
     {
         if (range_error) {
             if (diff_bytes < 0 || diff_bytes >= size_bytes)
-                (*range_error)(diff_bytes, 0, size_bytes);
+                (*range_error)("Memory", 0, diff_bytes, 0, size_bytes);
         }
         return base + diff_bytes;
     }
-
-    inline char *index_bytes(ptrdiff_t const diff_bytes, RangeErrorFn *range_error = nullptr)
-        { return const_cast<char *>(index(diff_bytes, range_error)); }
-
-
-public:
-    template<class ValueT>
-    inline ValueT const &index(ptrdiff_t const diff, RangeErrorFn *range_error = nullptr) const
-    {
-        return *reinterpret_cast<ValueT *>(
-            index_bytes(diff*sizeof(ValueT), range_error));
-    }
-
-    template<class ValueT>
-    inline ValueT &index(ptrdiff_t const diff, RangeErrorFn *range_error = nullptr)
-    {
-        return *const_cast<ValueT *>(&index(diff, range_error));
-    }
-
 
 };
 
@@ -118,41 +117,77 @@ struct Dope {
 }
 
 template<class IndexT>
-inline ptrdiff_t index(
+inline ptrdiff_t index_diff(
     Dope const * const dopes,
     IndexT const * const index,
     int const rank,
-    RangeErrorFn *range_error = nullptr)
+    RangeErrorFn const * const range_error = nullptr)
 {
     ptrdiff_t diff = 0;
     for (int i=0; i<rank; ++i) {
         if (range_error) {
             if ((index[i] < dopes[i].range[0]) || (index[i] >= dopes[i].range[1]))
-                (*range_error)(index[i], range[0], range[1]);
+                (*range_error)("Indexing", i, index[i], range[0], range[1]);
         }
         diff += index[i] * dopes[i].stride;
     }
     return diff;
 }
+
+template<class ValueT, class IndexT>
+inline ValueT &index(
+    MemoryBlock<typename transfer_const<char, ValueT>::type> const &memory,
+    Dope const * const dopes,
+    IndexT const * const index,
+    int const rank,
+    RangeErrorFn const * const range_error = nullptr)
+{
+    typedef typename transfer_const<char, ValueT>::type CharT;
+
+    ptrdiff_t const diff = index_diff(dopes, index, rank, range_error);
+    CharT * const loc = memory.index_bytes(diff*sizeof(ValueT), range_error);
+    ValueT * const vloc = reinterpret_cast<ValueT *>(loc);    // same constness
+    return *vloc;
+}
+
+
 // ---------------------------------------------------------------
-template<class IndexT, class ValueT>
+template<class ValueT, class IndexT=int>    // ValueT = double, const double, etc.
 class GeneralArray {
-    MemoryBlock const memory;
-    std::vector<Dope<IndexT>> const dopes;
+    typedef transfer_const<char, ValueT>::type CharT;
 
-    int rank() { return dopes.size(); }
+    MemoryBlock<CharT> _memory;    // Like a shared_ptr
+    std::vector<Dope<IndexT>> _dopes;
 
-    ValueT &operator[](IndexT *index, RangeErrorFn *range_error=nullptr)
-    {
-        return memory.index<ValueT>(index(&dopes[0], index, rank(), range_error));
-    }
+public:
+    int rank() const { return _dopes.size(); }
 
-    ValueT &operator[](IndexT *index, RangeErrorFn *range_error=nullptr) const
-    {
-        return memory.index<ValueT>(index(&dopes[0], index, rank(), range_error));
-    }
+    ValueT &operator[](IndexT const *index, RangeErrorFn const * const range_error=nullptr) const
+        { return index(_memory, &_dopes[0], index, rank(), range_error); }
+
+    ValueT &operator[](std::vector<IndexT> const &index, RangeErrorFn const * const range_error=nullptr) const
+        { return index(_memory, &_dopes[0], &index[0], rank(), range_error); }
+
 
 };
+
+
+template<class ValueT, int RANK, class IndexT=int>    // ValueT = double, const double, etc.
+class Array {
+    typedef typename transfer_const<char, ValueT>::type CharT;
+
+    MemoryBlock<CharT> _memory;    // Like a shared_ptr
+    std::vector<Dope<IndexT>> _dopes;
+
+public:
+    int rank() const { return RANK; }
+
+    ValueT &operator[](IndexT const * const index, RangeErrorFn const * const range_error=nullptr) const
+        { return index(_memory, &_dopes[0], index, rank(), range_error); }
+
+};
+
+
 
 // ---------------------------------------------------------------
 
